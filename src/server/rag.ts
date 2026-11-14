@@ -891,26 +891,24 @@ export async function searchKnowledge(
       rank: index + 1,
     }),
   );
-  const semanticRanked: RankedKnowledge<SearchChunk>[] = semantic.map(
-    (item, index) => ({ item: item.item, rank: index + 1 }),
-  );
   const strategy = settings?.retrievalStrategy ?? "hybrid";
   const topK = settings?.maxContextChunks ?? 5;
   const minSimilarity = settings?.minSimilarity ?? 0;
-  const filteredSemantic = settings
-    ? semantic.filter((entry) => entry.score >= minSimilarity)
-    : semantic;
+  const filteredSemanticRanked: RankedKnowledge<SearchChunk>[] = (
+    settings
+      ? semantic.filter((entry) => entry.score >= minSimilarity)
+      : semantic
+  ).map((entry, index) => ({ item: entry.item, rank: index + 1 }));
   const results = (
     settings && !settings.enableRrf
-      ? (strategy === "keyword"
-          ? lexicalRanked
-          : strategy === "vector"
-            ? filteredSemantic
-            : reciprocalRankFusion(lexicalRanked, filteredSemantic, topK)
-        ).slice(0, topK)
+      ? strategy === "keyword"
+        ? lexicalRanked.slice(0, topK).map(({ item }) => item)
+        : strategy === "vector"
+          ? filteredSemanticRanked.slice(0, topK).map(({ item }) => item)
+          : reciprocalRankFusion(lexicalRanked, filteredSemanticRanked, topK)
       : reciprocalRankFusion(
           strategy === "keyword" ? [] : lexicalRanked,
-          strategy === "vector" ? [] : filteredSemantic,
+          strategy === "vector" ? [] : filteredSemanticRanked,
           topK,
         )
   ).map((chunk) => ({
