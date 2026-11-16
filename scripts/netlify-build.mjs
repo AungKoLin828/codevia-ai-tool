@@ -13,8 +13,4 @@ function run(args) {
   }
 }
 
-if (process.env.CONTEXT === "production") {
-  run(["run", "prisma:deploy"]);
-}
-
 run(["run", "build"]);

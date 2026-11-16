@@ -684,20 +684,19 @@ export async function searchKnowledge(projectId, userId, queryValue, provider, s
         },
         rank: index + 1,
     }));
-    const semanticRanked = semantic.map((item, index) => ({ item: item.item, rank: index + 1 }));
     const strategy = settings?.retrievalStrategy ?? "hybrid";
     const topK = settings?.maxContextChunks ?? 5;
     const minSimilarity = settings?.minSimilarity ?? 0;
-    const filteredSemantic = settings
+    const filteredSemanticRanked = (settings
         ? semantic.filter((entry) => entry.score >= minSimilarity)
-        : semantic;
+        : semantic).map((entry, index) => ({ item: entry.item, rank: index + 1 }));
     const results = (settings && !settings.enableRrf
-        ? (strategy === "keyword"
-            ? lexicalRanked
+        ? strategy === "keyword"
+            ? lexicalRanked.slice(0, topK).map(({ item }) => item)
             : strategy === "vector"
-                ? filteredSemantic
-                : reciprocalRankFusion(lexicalRanked, filteredSemantic, topK)).slice(0, topK)
-        : reciprocalRankFusion(strategy === "keyword" ? [] : lexicalRanked, strategy === "vector" ? [] : filteredSemantic, topK)).map((chunk) => ({
+                ? filteredSemanticRanked.slice(0, topK).map(({ item }) => item)
+                : reciprocalRankFusion(lexicalRanked, filteredSemanticRanked, topK)
+        : reciprocalRankFusion(strategy === "keyword" ? [] : lexicalRanked, strategy === "vector" ? [] : filteredSemanticRanked, topK)).map((chunk) => ({
         id: chunk.id,
         sourceName: chunk.sourceName,
         uri: chunk.sourceUri,
