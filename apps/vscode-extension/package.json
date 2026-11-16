@@ -162,7 +162,7 @@
         },
         "codevia.netlifyBackendUrl": {
           "type": "string",
-          "default": "https://devforge-ai-tool.netlify.app",
+          "default": "https://codevia-ai-tool.netlify.app",
           "description": "Base URL of the deployed Codevia AI Netlify site."
         },
         "codevia.maxWorkspaceFiles": {

@@ -921,7 +921,7 @@ function getBackendUrl(environment = getBackendEnvironment()): string {
   const fallback =
     environment === "local"
       ? "http://localhost:8888"
-      : "https://devforge-ai-tool.netlify.app";
+      : "https://codevia-ai-tool.netlify.app";
   return String(getExtensionSetting(key, fallback)).trim().replace(/\/+$/, "");
 }
 
@@ -1068,7 +1068,7 @@ async function selectBackend(): Promise<void> {
       label: "Hosted server (Netlify)",
       description: getConfigString(
         "netlifyBackendUrl",
-        "https://devforge-ai-tool.netlify.app",
+        "https://codevia-ai-tool.netlify.app",
       ),
       environment: "netlify" as const,
     },
@@ -1194,7 +1194,7 @@ const vscode=acquireVsCodeApi();const github=document.getElementById('github');c
         throw new Error(
           data.message ||
             data.error ||
-            "The backend does not support device-pairing sign-in. Check the backend's existing authentication flow.",
+            "The backend does not support VS Code sign-in yet. Deploy the Codevia AI backend with the /api/auth/pair/start and /api/auth/pair/poll routes, then try again.",
         );
       }
       const connectUrl = vscode.Uri.parse(

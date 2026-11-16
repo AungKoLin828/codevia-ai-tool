@@ -14,7 +14,7 @@ The extension supports both environments without changing the Codevia AI web app
 
 - `Codevia AI Developer Tools: Backend Environment` = `local` or `netlify` (default).
 - `Local Backend Url` defaults to `http://localhost:8888`.
-- `Netlify Backend Url` defaults to `https://devforge-ai-tool.netlify.app`.
+- `Netlify Backend Url` defaults to `https://codevia-ai-tool.netlify.app`.
 
 The current setting namespace is `codevia.*`. Existing `devforge.*` values are still read when no corresponding `codevia.*` value is set, so workspaces and user settings continue to work after upgrading. New or changed settings are saved under `codevia.*`.
 
@@ -60,7 +60,7 @@ It does **not** call a new `/api/vscode/assistant` endpoint. AI provider credent
 Open PowerShell:
 
 ```powershell
-cd C:\devforge-ai-tool\apps\vscode-extension
+cd C:\codevia-ai-tool\apps\vscode-extension
 npm install
 npm run compile
 npm test
@@ -134,7 +134,7 @@ Run **Codevia AI: Select Backend** and confirm the correct server is selected. F
 
 ### `Authentication required` or `session expired`
 
-Run **Codevia AI: Sign In (Choose Backend)** and complete browser pairing for the backend you want to reconnect.
+Run **Codevia AI: Sign In (Choose Backend)** and complete browser pairing for the backend you want to reconnect. If sign-in reports that pairing is unsupported, deploy the current Codevia AI backend so `/api/auth/pair/start` and `/api/auth/pair/poll` are available, and confirm `Netlify Backend Url` points to that deployment.
 
 ### `AI provider is not configured`
 
@@ -151,7 +151,7 @@ Review fewer workspace files or reduce the active file's size. Do not include `.
 ### Compilation errors
 
 ```powershell
-cd C:\devforge-ai-tool\apps\vscode-extension
+cd C:\codevia-ai-tool\apps\vscode-extension
 npm install
 npm run compile
 ```

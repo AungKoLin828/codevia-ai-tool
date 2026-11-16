@@ -16,7 +16,7 @@ const agentFiles = {
 const allowedOrigins = new Set([
   "http://localhost:8888",
   "http://localhost:5173",
-  "https://devforge-ai-tool.netlify.app",
+  "https://codevia-ai-tool.netlify.app",
 ]);
 let startTask: Promise<void> | undefined;
 
@@ -108,7 +108,7 @@ async function fetchAgentFile(
   let temporaryPath: string | undefined;
   try {
     const response = await fetch(
-      `https://raw.githubusercontent.com/AungKoLin828/devforge-ai-tool/main/agent/src/${name}`,
+      `https://raw.githubusercontent.com/AungKoLin828/codevia-ai-tool/main/agent/src/${name}`,
       { signal: controller.signal },
     );
     if (!response.ok) {
@@ -196,7 +196,7 @@ function nodeMajorVersion(): Promise<number> {
 async function isAgentRunning(): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${agentPort}/pair`, {
-      headers: { Origin: "https://devforge-ai-tool.netlify.app" },
+      headers: { Origin: "https://codevia-ai-tool.netlify.app" },
       signal: AbortSignal.timeout(1_000),
     });
     if (!response.ok) return false;
