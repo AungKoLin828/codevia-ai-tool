@@ -12,6 +12,7 @@ import {
   hashWorkspaceContent,
   isEligibleWorkspacePath,
 } from "./workspaceIndex.js";
+import { normalizeBackendUrl } from "./backendUrl.js";
 
 const DIAGNOSTIC_SOURCE = "Codevia AI";
 const SESSION_SECRET_KEY_PREFIX = "devforge.backendSessionCookie";
@@ -922,7 +923,7 @@ function getBackendUrl(environment = getBackendEnvironment()): string {
     environment === "local"
       ? "http://localhost:8888"
       : "https://codevia-ai-tool.netlify.app";
-  return String(getExtensionSetting(key, fallback)).trim().replace(/\/+$/, "");
+  return normalizeBackendUrl(String(getExtensionSetting(key, fallback)));
 }
 
 function getBackendEnvironment(): BackendEnvironment {

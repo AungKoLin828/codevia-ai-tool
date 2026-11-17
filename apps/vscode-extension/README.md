@@ -18,6 +18,8 @@ The extension supports both environments without changing the Codevia AI web app
 
 The current setting namespace is `codevia.*`. Existing `devforge.*` values are still read when no corresponding `codevia.*` value is set, so workspaces and user settings continue to work after upgrading. New or changed settings are saved under `codevia.*`.
 
+If an older setting points to `https://devforge-ai-tool.netlify.app`, the extension automatically updates that previous hosted URL to `https://codevia-ai-tool.netlify.app`.
+
 ### Local development
 
 1. Start the Codevia AI web app from its project root using `npm run dev:netlify`.
