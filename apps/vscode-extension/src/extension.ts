@@ -15,6 +15,13 @@ import {
 import { normalizeBackendUrl } from "./backendUrl.js";
 
 const DIAGNOSTIC_SOURCE = "Codevia AI";
+let extensionOutput: vscode.OutputChannel | undefined;
+function getOutput(): vscode.OutputChannel {
+  if (!extensionOutput) {
+    extensionOutput = vscode.window.createOutputChannel("Codevia AI");
+  }
+  return extensionOutput;
+}
 const SESSION_SECRET_KEY_PREFIX = "devforge.backendSessionCookie";
 const PROJECT_STATE_KEY_PREFIX = "devforge.selectedProjectId";
 const PROVIDER_STATE_KEY_PREFIX = "devforge.selectedAiProvider";
@@ -694,6 +701,93 @@ function getProviderStateKey(): string {
   return `${PROVIDER_STATE_KEY_PREFIX}:${getBackendEnvironment()}`;
 }
 
+/** One persisted chat transcript message. */
+type ChatHistoryEntry = {
+  role: "user" | "assistant";
+  text: string;
+  at: number;
+};
+
+const CHAT_HISTORY_KEY_PREFIX = "devforge.chatHistory";
+const CHAT_HISTORY_LIMIT = 50;
+const CHAT_HISTORY_MESSAGE_LIMIT = 4000;
+
+function getChatHistoryStateKey(): string {
+  // Keep the transcript separate per backend, like sessions and projects.
+  return `${CHAT_HISTORY_KEY_PREFIX}:${getBackendEnvironment()}`;
+}
+
+/** The persisted chat transcript for the active backend, oldest first. */
+function getChatHistory(
+  context: vscode.ExtensionContext,
+): ChatHistoryEntry[] {
+  const stored = context.globalState.get<ChatHistoryEntry[]>(
+    getChatHistoryStateKey(),
+  );
+  if (!Array.isArray(stored)) return [];
+  return stored
+    .filter(
+      (entry): entry is ChatHistoryEntry =>
+        Boolean(entry) &&
+        (entry.role === "user" || entry.role === "assistant") &&
+        typeof entry.text === "string" &&
+        entry.text.trim().length > 0,
+    )
+    .slice(-CHAT_HISTORY_LIMIT);
+}
+
+/** Append a chat message to the persisted transcript for the active backend. */
+async function recordChatMessage(
+  context: vscode.ExtensionContext,
+  role: ChatHistoryEntry["role"],
+  text: string,
+): Promise<void> {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const history = getChatHistory(context);
+  history.push({
+    role,
+    text: trimmed.slice(0, CHAT_HISTORY_MESSAGE_LIMIT),
+    at: Date.now(),
+  });
+  const updated = history.slice(-CHAT_HISTORY_LIMIT);
+  await context.globalState.update(getChatHistoryStateKey(), updated);
+  saveChatHistoryToDisk(context, updated);
+}
+
+/**
+ * Mirror the persisted chat transcript to a JSON file on the local PC so it
+ * survives even if VS Code's global state is reset. Written in the
+ * background (fire-and-forget) so chat is never blocked by disk I/O.
+ * Location: <globalStorage>/chat-history/<backend>.json
+ */
+function saveChatHistoryToDisk(
+  context: vscode.ExtensionContext,
+  history: ChatHistoryEntry[],
+): void {
+  void (async () => {
+    try {
+      const dir = vscode.Uri.joinPath(context.globalStorageUri, "chat-history");
+      await vscode.workspace.fs.createDirectory(dir);
+      const file = vscode.Uri.joinPath(dir, `${getBackendEnvironment()}.json`);
+      await vscode.workspace.fs.writeFile(
+        file,
+        Buffer.from(JSON.stringify(history, null, 2), "utf8"),
+      );
+    } catch (error) {
+      getOutput().appendLine(
+        `[chat-history] Failed to save transcript to disk: ${String(error)}`,
+      );
+    }
+  })();
+}
+
+/** Remove the persisted chat transcript for the active backend. */
+async function clearChatHistory(context: vscode.ExtensionContext): Promise<void> {
+  await context.globalState.update(getChatHistoryStateKey(), []);
+  saveChatHistoryToDisk(context, []);
+}
+
 /** Selected AI provider for this backend; OpenRouter is the default. */
 async function getSelectedProvider(
   context: vscode.ExtensionContext,
@@ -879,8 +973,58 @@ async function fetchCustomModels(
 }
 
 /**
- * Fetch the public OpenRouter model catalog (no API key required) so any
- * provider can offer OpenRouter model ids to pick from.
+ * A scored OpenRouter model entry. Coding-first ranking puts free,
+ * programming-capable models at the top of the picker.
+ */
+type RankedModel = { id: string; free: boolean; coding: boolean; score: number };
+
+/** Coding signals used for ranking model ids. */
+const CODING_MODEL_HINTS = [
+  "coder",
+  "devstral",
+  "codestral",
+  "deepseek",
+  "qwq",
+  "code",
+  "glm",
+  "kimi",
+];
+const PREFERRED_FREE_CODING_PREFIXES = [
+  "qwen/qwen3-coder",
+  "deepseek/deepseek-chat-v3",
+  "z-ai/glm-4",
+  "mistralai/devstral",
+  "meta-llama/llama-3.3",
+  "deepseek/deepseek-r1",
+  "moonshotai/kimi",
+  "qwen/qwq",
+];
+
+/**
+ * Rank an OpenRouter model id for programming use. Free models always rank
+ * above paid ones; within each tier, strong coding models come first.
+ */
+function rankOpenRouterModel(id: string): RankedModel {
+  const lower = id.toLowerCase();
+  // OpenRouter marks genuinely free variants with a ":free" suffix.
+  const free = lower.endsWith(":free");
+  const coding = CODING_MODEL_HINTS.some((hint) => lower.includes(hint));
+  let score = 0;
+  if (free) score += 1000;
+  if (coding) score += 100;
+  for (const [rank, prefix] of PREFERRED_FREE_CODING_PREFIXES.entries())
+    if (lower.startsWith(prefix)) score += 50 - rank;
+  // Small context "instruct" variants are less useful for programming tasks.
+  if (/(?:-8b|-7b|-4b|-1\.5b|-03b|small|mini|tiny)/.test(lower)) score -= 20;
+  // Avoid image/vision/experimental-only variants for coding work.
+  if (/(?:vision|-vl|image|whisper|tts|embed)/.test(lower)) score -= 200;
+  return { id, free, coding, score };
+}
+
+/**
+ * Fetch the public OpenRouter model catalog (no API key required), ranked
+ * programming-first: free coding models first, then other coding models,
+ * then everything else alphabetically.
  */
 async function fetchOpenRouterModels(): Promise<string[]> {
   const controller = new AbortController();
@@ -904,10 +1048,32 @@ async function fetchOpenRouterModels(): Promise<string[]> {
         (id: unknown): id is string =>
           typeof id === "string" && id.trim().length > 0,
       )
-      .sort((a: string, b: string) => a.localeCompare(b));
+      .map(rankOpenRouterModel)
+      .sort(
+        (a, b) =>
+          b.score - a.score || a.id.localeCompare(b.id),
+      )
+      .map((model) => model.id);
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * The default suggested OpenRouter model: the top-ranked free coding model
+ * from the live catalog, so the extension works without a paid plan.
+ */
+async function suggestDefaultModel(): Promise<string> {
+  try {
+    const models = await fetchOpenRouterModels();
+    const ranked = models.map(rankOpenRouterModel);
+    const best =
+      ranked.find((m) => m.free && m.coding) ?? ranked.find((m) => m.free);
+    if (best) return best.id;
+  } catch {
+    // Fall back to the known free coding model below.
+  }
+  return "qwen/qwen3-coder:free";
 }
 type ApiProject = {
   id: string;
@@ -1021,6 +1187,37 @@ async function apiRequest<T>(
   }
 }
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function getNetworkErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    if (current instanceof Error) {
+      const code = (current as Error & { code?: string }).code;
+      if (typeof code === "string") return code;
+      current = (current as Error & { cause?: unknown }).cause;
+    } else {
+      break;
+    }
+  }
+  return undefined;
+}
+
+function isTransientNetworkError(error: unknown): boolean {
+  const code = getNetworkErrorCode(error);
+  return code !== undefined && TRANSIENT_NETWORK_CODES.has(code);
+}
+
 async function fetchBackend(
   url: string,
   init: RequestInit = {},
@@ -1041,11 +1238,6 @@ async function fetchBackend(
       const local = ["localhost", "127.0.0.1", "[::1]"].includes(
         backend.hostname,
       );
-      const cause = error as Error & { cause?: unknown };
-      const code =
-        cause.cause && typeof cause.cause === "object" && "code" in cause.cause
-          ? String(cause.cause.code)
-          : undefined;
       const reason =
         error.name === "AbortError"
           ? "The request timed out."
@@ -1054,13 +1246,39 @@ async function fetchBackend(
         ? "Start the local app with `npm run dev:netlify` and check the Local Backend Url setting."
         : "Check your internet connection and the Netlify Backend Url setting.";
       throw new Error(
-        `${reason} Could not reach the Codevia backend at ${backend.origin}.${code ? ` Network error: ${code}.` : ""} ${nextStep}`,
+        `${reason} Could not reach the Codevia backend at ${backend.origin}.${getNetworkErrorCode(error) ? ` Network error: ${getNetworkErrorCode(error)}.` : ""} ${nextStep}`,
       );
     }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Fetches with automatic retries for transient network failures (connection
+ * resets, timeouts, DNS hiccups) which are common against Netlify cold starts.
+ * Retries only on transient network errors; HTTP errors are never retried.
+ */
+async function fetchBackendWithRetry(
+  url: string,
+  init: RequestInit = {},
+  retries = 3,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetchBackend(url, init);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      lastError = error;
+      if (!isTransientNetworkError(error)) throw error;
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function selectBackend(): Promise<void> {
@@ -1182,10 +1400,13 @@ const vscode=acquireVsCodeApi();const github=document.getElementById('github');c
     running = true;
     post("status", "Requesting a one-time sign-in code…");
     try {
-      const response = await fetchBackend(`${baseUrl}/api/auth/pair/start`, {
-        method: "POST",
-        headers: { Accept: "application/json" },
-      });
+      const response = await fetchBackendWithRetry(
+        `${baseUrl}/api/auth/pair/start`,
+        {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        },
+      );
       const data = (await response.json().catch(() => ({}))) as {
         code?: string;
         error?: string;
@@ -1208,89 +1429,98 @@ const vscode=acquireVsCodeApi();const github=document.getElementById('github');c
       );
       const deadline = Date.now() + 10 * 60 * 1000;
       while (Date.now() < deadline && !panelClosed) {
-        const result = await fetchBackend(`${baseUrl}/api/auth/pair/poll`, {
-          method: "POST",
-          headers: {
-            Accept: "application/json",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ code: data.code }),
-        });
-        const polled = (await result.json().catch(() => ({}))) as {
-          pending?: boolean;
-          token?: string;
-          error?: string;
-          message?: string;
-        };
-        if (result.ok && !polled.pending && polled.token) {
-          const sessionSecretKey = getSessionSecretKey(environment);
-          await context.secrets.store(sessionSecretKey, polled.token);
-          try {
-            const response = await fetchBackend(`${baseUrl}/api/auth/me`, {
+        try {
+          const result = await fetchBackendWithRetry(
+            `${baseUrl}/api/auth/pair/poll`,
+            {
+              method: "POST",
               headers: {
                 Accept: "application/json",
-                Cookie: `devforge_session=${polled.token}`,
+                "Content-Type": "application/json",
               },
-            });
-            const resultMe = (await response.json().catch(() => ({}))) as {
-              message?: string;
-              user?: {
-                githubUsername?: string | null;
-                githubName?: string | null;
-                email?: string | null;
-              };
-            };
-            if (!response.ok) {
-              throw new Error(
-                resultMe.message ||
-                  `The ${environmentLabel.toLowerCase()} session could not be verified (HTTP ${response.status}).`,
-              );
-            }
-            const user = resultMe.user;
-            const identity = user?.githubUsername
-              ? `@${user.githubUsername}`
-              : (user?.email ?? user?.githubName);
-            if (getBackendEnvironment() !== environment) {
-              try {
-                await setBackendEnvironment(environment);
-              } catch (error) {
-                const message =
-                  error instanceof Error ? error.message : String(error);
-                post(
-                  "success",
-                  `Connected successfully${identity ? ` as ${identity}` : ""}, but the active backend could not be changed. Select the ${environmentLabel} backend, then open chat.`,
-                );
-                vscode.window.showErrorMessage(
-                  `Codevia AI signed in, but could not switch to the ${environmentLabel} backend: ${message}`,
-                );
-                refreshCommandsTree();
-                return;
-              }
-            }
-            const nextStep = "Opening chat…";
-            post(
-              "success",
-              `Connected successfully${identity ? ` as ${identity}` : ""}. ${nextStep}`,
-            );
-            refreshCommandsTree();
-            vscode.window.showInformationMessage(
-              `Connected to ${environmentLabel}${identity ? ` as ${identity}` : ""}. ${nextStep}`,
-            );
-            setTimeout(() => {
-              void vscode.commands.executeCommand("codevia.openChat");
-            }, 600);
-            return;
-          } catch (error) {
-            await context.secrets.delete(sessionSecretKey);
-            throw error;
-          }
-        }
-        if (!result.ok && result.status !== 400 && result.status !== 404) {
-          throw new Error(
-            polled.message ||
-              polled.error ||
-              `Sign-in polling failed (HTTP ${result.status}).`,
+              body: JSON.stringify({ code: data.code }),
+            },
           );
+          const polled = (await result.json().catch(() => ({}))) as {
+            pending?: boolean;
+            token?: string;
+            error?: string;
+            message?: string;
+          };
+          if (result.ok && !polled.pending && polled.token) {
+            const sessionSecretKey = getSessionSecretKey(environment);
+            await context.secrets.store(sessionSecretKey, polled.token);
+            try {
+              const response = await fetchBackend(`${baseUrl}/api/auth/me`, {
+                headers: {
+                  Accept: "application/json",
+                  Cookie: `devforge_session=${polled.token}`,
+                },
+              });
+              const resultMe = (await response.json().catch(() => ({}))) as {
+                message?: string;
+                user?: {
+                  githubUsername?: string | null;
+                  githubName?: string | null;
+                  email?: string | null;
+                };
+              };
+              if (!response.ok) {
+                throw new Error(
+                  resultMe.message ||
+                    `The ${environmentLabel.toLowerCase()} session could not be verified (HTTP ${response.status}).`,
+                );
+              }
+              const user = resultMe.user;
+              const identity = user?.githubUsername
+                ? `@${user.githubUsername}`
+                : (user?.email ?? user?.githubName);
+              if (getBackendEnvironment() !== environment) {
+                try {
+                  await setBackendEnvironment(environment);
+                } catch (error) {
+                  const message =
+                    error instanceof Error ? error.message : String(error);
+                  post(
+                    "success",
+                    `Connected successfully${identity ? ` as ${identity}` : ""}, but the active backend could not be changed. Select the ${environmentLabel} backend, then open chat.`,
+                  );
+                  vscode.window.showErrorMessage(
+                    `Codevia AI signed in, but could not switch to the ${environmentLabel} backend: ${message}`,
+                  );
+                  refreshCommandsTree();
+                  return;
+                }
+              }
+              const nextStep = "Opening chat…";
+              post(
+                "success",
+                `Connected successfully${identity ? ` as ${identity}` : ""}. ${nextStep}`,
+              );
+              refreshCommandsTree();
+              vscode.window.showInformationMessage(
+                `Connected to ${environmentLabel}${identity ? ` as ${identity}` : ""}. ${nextStep}`,
+              );
+              setTimeout(() => {
+                void vscode.commands.executeCommand("codevia.openChat");
+              }, 600);
+              return;
+            } catch (error) {
+              await context.secrets.delete(sessionSecretKey);
+              throw error;
+            }
+          }
+          if (!result.ok && result.status !== 400 && result.status !== 404) {
+            throw new Error(
+              polled.message ||
+                polled.error ||
+                `Sign-in polling failed (HTTP ${result.status}).`,
+            );
+          }
+        } catch (pollError) {
+          // A transient network blip (e.g. Netlify cold start or ECONNRESET)
+          // must not abort the whole sign-in; keep polling until the deadline.
+          if (!isTransientNetworkError(pollError)) throw pollError;
         }
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
@@ -2717,10 +2947,17 @@ async function openChat(
     for (const resolve of pendingChatActions.values()) resolve(undefined);
     pendingChatActions.clear();
   });
+  // Restore the persisted chat transcript for this session/backend on open.
+  void panel.webview.postMessage({
+    type: "history",
+    entries: getChatHistory(context),
+  });
   panel.webview.html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${panel.webview.cspSource} https:; style-src ${panel.webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';"><title>Codevia AI</title><style>
   :root{color-scheme:dark;--bg:var(--vscode-sideBar-background);--panel:var(--vscode-editor-background);--fg:var(--vscode-foreground);--border:var(--vscode-panel-border);--accent:var(--vscode-button-background)}*{box-sizing:border-box}body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:13px var(--vscode-font-family)}header{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)}header img{width:40px;height:40px;object-fit:contain;border-radius:8px}header h1{font-size:15px;margin:0 0 2px}header p{margin:0;opacity:.7;font-size:11px}.wrap{height:calc(100vh - 70px);display:flex;flex-direction:column}.messages{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:10px}.msg{padding:9px 12px;border:1px solid var(--border);border-radius:10px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}.user{background:var(--vscode-textBlockQuote-background);align-self:flex-end;max-width:92%}.assistant{background:var(--panel);align-self:stretch}.steps{background:var(--panel);align-self:stretch;border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:12px}.steps .title{font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:6px}.steps .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--vscode-panel-border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}.steps.done .spin{display:none}.steps .step{display:flex;align-items:center;gap:7px;padding:2px 0;color:var(--vscode-descriptionForeground)}.steps .step .icon{width:13px;text-align:center;flex:none}.steps .step .label{overflow-wrap:anywhere}.steps .step.running{color:var(--fg)}.steps .step.done{color:var(--vscode-charts-green)}.steps .step.failed{color:var(--vscode-errorForeground)}.command-log{margin:6px 0 0;padding:8px;background:var(--bg);border-radius:5px;max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px var(--vscode-editor-font-family)}@keyframes spin{to{transform:rotate(360deg)}}.status{font-size:11px;opacity:.7;padding:0 14px 4px}.settings{border-bottom:1px solid var(--border)}.settings details{padding:0 14px}.settings summary{cursor:pointer;padding:8px 0;font-size:12px;opacity:.85}.settings .setbody{display:flex;flex-direction:column;gap:8px;padding:4px 0 12px}.settings label{display:flex;flex-direction:column;gap:3px;font-size:11px;opacity:.9}.settings select{appearance:none;-webkit-appearance:none;background-color:var(--vscode-dropdown-background,var(--panel))!important;color:var(--vscode-dropdown-foreground,var(--fg))!important}.settings select,.settings input{padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--fg);font:inherit;font-size:12px}.settings .modelrow{display:flex;gap:6px}.settings .modelrow input{flex:1}input[list]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.8}datalist{background:var(--panel);color:var(--fg)}datalist option{background:var(--vscode-dropdown-background,var(--panel));color:var(--vscode-dropdown-foreground,var(--fg));padding:4px 8px}.settings .modelrow button{padding:4px 9px;font-size:12px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:0;border-radius:4px;cursor:pointer}.settings .setrow{display:flex;align-items:center;justify-content:space-between;gap:8px}.settings #provStatus{font-size:11px;opacity:.75}.settings #provSave{background:var(--accent);color:var(--vscode-button-foreground);border:0;border-radius:4px;padding:6px 14px;cursor:pointer}.compose{padding:10px 12px 12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px}textarea{width:100%;resize:vertical;min-height:70px;max-height:220px;color:var(--fg);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:9px;font:inherit}button{align-self:flex-end;background:var(--accent);color:var(--vscode-button-foreground);border:0;border-radius:5px;padding:7px 14px;cursor:pointer}button:disabled{opacity:.5} .hint{font-size:11px;opacity:.7}
-  </style></head><body><header><img src="${logo}" alt="Codevia AI logo"><div><h1>Codevia AI</h1><p>Copilot-style assistant · dedicated assistant API</p></div></header><div class="settings"><details><summary>⚙ AI provider &amp; API key</summary><div class="setbody"><label>Provider<select id="provSel"><option value="OPENROUTER">OpenRouter</option><option value="OPENAI">OpenAI</option><option value="CUSTOM">Custom OpenAI-compatible</option></select></label><label>Base URL (Custom only)<input id="provBase" placeholder="https://api.example.com/v1" spellcheck="false"></label><label>API key<input id="provKey" type="password" placeholder="Leave blank to keep saved key" autocomplete="off"></label><label>Model<div class="modelrow"><input id="provModel" list="modelList" placeholder="Model ID" spellcheck="false"><datalist id="modelList"></datalist><button id="loadModels" type="button" title="Load available models">↻</button></div></label><div class="setrow"><span id="provStatus"></span><button id="provSave">Save</button></div></div></details></div><div class="wrap"><div id="messages" class="messages"><div class="msg assistant">Hi! I'm Codevia AI. Ask me anything, or describe a feature and I'll run the workflow: plan → generate → save files to your workspace.</div></div><div id="status" class="status">Backend: ${escapeHtml(getBackendUrl())} · POST /api/assistant/chat</div><div class="compose"><textarea id="prompt" placeholder="Ask Codevia AI anything — build a feature, review code, explain, generate tests, or modify files…"></textarea><label class="hint"><input type="checkbox" id="includeContext" checked> Include the active source file as context (sensitive files are excluded)</label><button id="send">Send</button></div></div><script nonce="${nonce}">
-  const vscode=acquireVsCodeApi();const messages=document.getElementById('messages');const input=document.getElementById('prompt');const send=document.getElementById('send');const status=document.getElementById('status');const includeContext=document.getElementById('includeContext');const commandLogs=new Map();
+  </style></head><body><header><img src="${logo}" alt="Codevia AI logo"><div style="flex:1"><h1>Codevia AI</h1><p>Copilot-style assistant · dedicated assistant API</p></div><button id="clearHistory" type="button" title="Clear this session's chat history" style="align-self:center;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font-size:11px;padding:4px 10px">Clear history</button></header><div class="settings"><details><summary>⚙ AI provider &amp; API key</summary><div class="setbody"><label>Provider<select id="provSel"><option value="OPENROUTER">OpenRouter</option><option value="OPENAI">OpenAI</option><option value="CUSTOM">Custom OpenAI-compatible</option></select></label><label>Base URL (Custom only)<input id="provBase" placeholder="https://api.example.com/v1" spellcheck="false"></label><label>API key<input id="provKey" type="password" placeholder="Leave blank to keep saved key" autocomplete="off"></label><label>Model<div class="modelrow"><input id="provModel" list="modelList" placeholder="Model ID" spellcheck="false"><datalist id="modelList"></datalist><button id="loadModels" type="button" title="Load available models">↻</button></div></label><div class="setrow"><span id="provStatus"></span><button id="provSave">Save</button></div></div></details></div><div class="wrap"><div id="messages" class="messages"><div class="msg assistant">Hi! I'm Codevia AI. Ask me anything, or describe a feature and I'll run the workflow: plan → generate → save files to your workspace.</div></div><div id="status" class="status">Backend: ${escapeHtml(getBackendUrl())} · POST /api/assistant/chat</div><div class="compose"><textarea id="prompt" placeholder="Ask Codevia AI anything — build a feature, review code, explain, generate tests, or modify files…"></textarea><label class="hint"><input type="checkbox" id="includeContext" checked> Include the active source file as context (sensitive files are excluded)</label><button id="send">Send</button></div></div><script nonce="${nonce}">
+  const vscode=acquireVsCodeApi();const messages=document.getElementById('messages');const input=document.getElementById('prompt');const send=document.getElementById('send');const status=document.getElementById('status');const includeContext=document.getElementById('includeContext');const commandLogs=new Map();const clearHistory=document.getElementById('clearHistory');
+  clearHistory.addEventListener('click',()=>{vscode.postMessage({type:'clearHistory'});});
+  function renderHistoryItem(entry){const d=document.createElement('div');d.className='msg '+(entry.role==='user'?'user':'assistant');const when=new Date(entry.at||Date.now());d.textContent=(entry.role==='user'?'You':'Codevia AI')+' · '+when.toLocaleTimeString()+':\n'+(entry.text||'');messages.appendChild(d);}
   const provSel=document.getElementById('provSel'),provBase=document.getElementById('provBase'),provKey=document.getElementById('provKey'),provModel=document.getElementById('provModel'),provStatus=document.getElementById('provStatus'),provSave=document.getElementById('provSave'),loadModels=document.getElementById('loadModels'),modelList=document.getElementById('modelList');
   provBase.style.display='none';
   provSel.addEventListener('change',()=>{provBase.style.display=(provSel.value==='CUSTOM')?'':'none';vscode.postMessage({type:'providerSelected',provider:provSel.value});});
@@ -2737,6 +2974,8 @@ async function openChat(
   window.addEventListener('message',event=>{const m=event.data;
     if(m.type==='actionRequest')addActionRequest(m);
     if(m.type==='status')status.textContent=m.text;
+    if(m.type==='history'){messages.innerHTML='';const w=document.createElement('div');w.className='msg assistant';w.textContent="Hi! I'm Codevia AI. Ask me anything, or describe a feature and I'll run the workflow: plan → generate → save files to your workspace.";messages.appendChild(w);for(const entry of m.entries||[])renderHistoryItem(entry);messages.scrollTop=messages.scrollHeight;}
+    if(m.type==='historyCleared'){messages.innerHTML='';const w=document.createElement('div');w.className='msg assistant';w.textContent='Chat history cleared. Starting a fresh conversation.';messages.appendChild(w);status.textContent='History cleared';}
     if(m.type==='steps'){const b=addSteps(m.title,m.names);window.__steps=m.id;window.__stepBox=b;}
     if(m.type==='stepAdd'){const b=window.__stepBox;if(b){addStepRow(b,m.name);messages.scrollTop=messages.scrollHeight;}}
     if(m.type==='stepTitle'){const b=window.__stepBox;if(b)b.title.textContent=m.title;}
@@ -2745,8 +2984,8 @@ async function openChat(
     if(m.type==='stepsDone'){const b=window.__stepBox;if(b){b.el.classList.add('done');}}
     if(m.type==='commandOutputStart'){const d=add('assistant','');const title=document.createElement('div');title.textContent='Running: '+m.command+'\\nDirectory: '+m.cwd;const pre=document.createElement('pre');pre.className='command-log';pre.textContent='Waiting for command output…';d.appendChild(title);d.appendChild(pre);commandLogs.set(m.id,pre);}
     if(m.type==='commandOutput'){const pre=commandLogs.get(m.id);if(pre){pre.textContent=m.text||'Command produced no output yet.';pre.scrollTop=pre.scrollHeight;messages.scrollTop=messages.scrollHeight;}}
-    if(m.type==='providerState'){provSel.value=m.provider;provBase.style.display=(m.provider==='CUSTOM')?'':'none';provModel.value=m.model||'';provBase.value=m.baseUrl||'';provStatus.textContent=m.configured?'Configured':'Not configured yet';}
-    if(m.type==='modelsLoaded'){modelList.innerHTML='';for(const id of m.models){const o=document.createElement('option');o.value=id;modelList.appendChild(o);}provStatus.textContent=m.models.length+' models loaded';}
+    if(m.type==='providerState'){provSel.value=m.provider;provBase.style.display=(m.provider==='CUSTOM')?'':'none';provModel.value=m.model||'';provBase.value=m.baseUrl||'';provStatus.textContent=(m.suggested?'Suggested free coding model: ':'')+(m.configured?'Configured':'Not configured yet');}
+    if(m.type==='modelsLoaded'){modelList.innerHTML='';for(const id of m.models){const o=document.createElement('option');o.value=id;modelList.appendChild(o);}provStatus.textContent=m.models.length+' models loaded'+(m.freeCoding?' ('+m.freeCoding+' free coding models)':'')+' — free coding models are listed first';}
     if(m.type==='providerSaved'){provStatus.textContent='Saved ✓';provKey.value='';provSave.disabled=false;}
     if(m.type==='providerError'){provStatus.textContent=m.text;provSave.disabled=false;}
     if (m.type==='reply'){addReply(m.text,m.retryPrompt);send.disabled=false;status.textContent=m.backend||'Ready';input.focus();}
@@ -2777,13 +3016,32 @@ async function openChat(
         try {
           const providers = await listProviderInfos(context);
           const info = providers.find((p) => p.provider === message.provider);
+          const provider = message.provider as ProviderId;
+          // For OpenRouter with no saved model, suggest the top-ranked free
+          // coding model automatically so the extension works for free.
+          let suggestedModel = "";
+          if (provider === "OPENROUTER" && !info?.model)
+            suggestedModel = await suggestDefaultModel();
           await panel.webview.postMessage({
             type: "providerState",
-            provider: message.provider,
-            model: info?.model ?? "",
+            provider,
+            model: info?.model || suggestedModel,
             baseUrl: info?.baseUrl ?? "",
             configured: Boolean(info?.configured),
+            suggested: Boolean(suggestedModel) && !info?.model,
           });
+          // Preload the ranked model list for the suggestion-capable providers.
+          if (provider === "OPENROUTER") {
+            try {
+              const models = await fetchOpenRouterModels();
+              await panel.webview.postMessage({
+                type: "modelsLoaded",
+                models: models.slice(0, 300),
+              });
+            } catch {
+              // Model list loading is best-effort; the saved model still works.
+            }
+          }
         } catch {
           // Provider info is best-effort inside the chat page.
         }
@@ -2800,6 +3058,13 @@ async function openChat(
           await panel.webview.postMessage({
             type: "modelsLoaded",
             models: models.slice(0, 300),
+            freeCoding: models.filter(
+              (id) =>
+                id.toLowerCase().endsWith(":free") &&
+                CODING_MODEL_HINTS.some((hint) =>
+                  id.toLowerCase().includes(hint),
+                ),
+            ).length,
           });
         } catch (error) {
           await panel.webview.postMessage({
@@ -2807,6 +3072,11 @@ async function openChat(
             text: `Could not load models: ${error instanceof Error ? error.message : String(error)}`,
           });
         }
+        return;
+      }
+      if (message.type === "clearHistory") {
+        await clearChatHistory(context);
+        await panel.webview.postMessage({ type: "historyCleared" });
         return;
       }
       if (message.type === "saveProvider") {
@@ -2851,6 +3121,7 @@ async function openChat(
           throw new Error("Enter an instruction before sending.");
         lastPrompt = userPrompt;
         lastIncludeContext = message.includeActiveFile !== false;
+        await recordChatMessage(context, "user", userPrompt);
         await panel.webview.postMessage({
           type: "status",
           text: "Collecting workspace context…",
@@ -2910,11 +3181,13 @@ async function openChat(
           );
           await generationProgress(0, result ? "done" : "failed");
           await panel.webview.postMessage({ type: "stepsDone" });
+          const projectReplyText =
+            result?.text ??
+            "Project generation was cancelled before files were saved.";
+          await recordChatMessage(context, "assistant", projectReplyText);
           await panel.webview.postMessage({
             type: "reply",
-            text:
-              result?.text ??
-              "Project generation was cancelled before files were saved.",
+            text: projectReplyText,
             ...(result?.retryable ? { retryPrompt: userPrompt } : {}),
           });
           return;
@@ -3273,6 +3546,7 @@ async function openChat(
             .filter(Boolean)
             .join("\n\n");
           await panel.webview.postMessage({ type: "stepsDone" });
+          await recordChatMessage(context, "assistant", details);
           await panel.webview.postMessage({
             type: "reply",
             text: details,
@@ -3298,6 +3572,11 @@ async function openChat(
           title: commandPlan ? "Approved command workflow complete" : "Assistant response ready",
         });
         await panel.webview.postMessage({ type: "stepsDone" });
+        await recordChatMessage(
+          context,
+          "assistant",
+          reply + (retryFailure ? `\n\n${retryFailure}` : ""),
+        );
         await panel.webview.postMessage({
           type: "reply",
           text: reply + (retryFailure ? `\n\n${retryFailure}` : ""),
